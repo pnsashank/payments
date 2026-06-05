@@ -6,6 +6,10 @@ from awsglue.context import GlueContext
 from awsglue.job import Job 
 from pyspark.sql import functions as F 
 from pyspark.sql.types import DateType
+from pyspark.sql.types import (
+    StringType, IntegerType, LongType, DoubleType, FloatType,
+    BooleanType, DateType, TimestampType, DecimalType
+)
 
 args = getResolvedOptions(sys.argv, ["JOB_NAME", "S3_BUCKET", "RAW_DB", "CURATED_DB"])
 
@@ -198,23 +202,60 @@ fact_settlements = settlements.select(
     F.datediff("settlement_date", "settlement_period_end").alias("settlement_delay_days"),
     F.date_format("settlement_date", "yyyyMMdd").cast("int").alias("date_key")
 )
+# Write curated tables and register in glue catalog
+def spark_type_to_hive(spark_type):
+    mapping = {
+        StringType: "STRING",
+        IntegerType: "INT",
+        LongType: "BIGINT",
+        DoubleType: "DOUBLE",
+        FloatType: "FLOAT",
+        BooleanType: "BOOLEAN",
+        DateType: "DATE",
+        TimestampType: "TIMESTAMP",
+    }
+    for type_class, hive_type in mapping.items():
+        if isinstance(spark_type, type_class):
+            return hive_type
+    if isinstance(spark_type, DecimalType):
+        return f"DECIMAL({spark_type.precision},{spark_type.scale})"
+    return "STRING"
 
-# Write Curated Tables and Register in Glue Catalog
+
 def write_curated_table(df, table_name, partition_cols=None):
     path = f"{S3_CURATED_BASE}/{table_name}/"
     print(f"Writing {table_name} ({df.count():,} rows) to {path}")
- 
+
     writer = df.write.mode("overwrite").format("parquet").option("compression", "snappy")
     if partition_cols:
         writer = writer.partitionBy(*partition_cols)
     writer.save(path)
 
     spark.sql(f"DROP TABLE IF EXISTS {CURATED_DB}.{table_name}")
-    spark.sql(f"""
-        CREATE EXTERNAL TABLE {CURATED_DB}.{table_name}
-        USING PARQUET
-        LOCATION '{path}'
-    """)
+
+    if partition_cols:
+        non_partition_fields = [f for f in df.schema.fields if f.name not in partition_cols]
+        partition_fields  = [f for f in df.schema.fields if f.name in partition_cols]
+
+        cols_ddl      = ",\n        ".join([f"`{f.name}` {spark_type_to_hive(f.dataType)}" for f in non_partition_fields])
+        partition_ddl = ", ".join([f"`{f.name}` {spark_type_to_hive(f.dataType)}" for f in partition_fields])
+
+        spark.sql(f"""
+            CREATE EXTERNAL TABLE {CURATED_DB}.{table_name} (
+                {cols_ddl}
+            )
+            PARTITIONED BY ({partition_ddl})
+            STORED AS PARQUET
+            LOCATION '{path}'
+        """)
+        spark.sql(f"MSCK REPAIR TABLE {CURATED_DB}.{table_name}")
+    else:
+        spark.sql(f"""
+            CREATE EXTERNAL TABLE {CURATED_DB}.{table_name}
+            USING PARQUET
+            LOCATION '{path}'
+        """)
+
     print(f"{table_name} registered in {CURATED_DB}")
 
 # Dimensions
